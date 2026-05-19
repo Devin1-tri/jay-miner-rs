@@ -178,6 +178,29 @@ jay-miner --help
 | `--balance-interval` | `JAY_BALANCE_INTERVAL` | `60` (seconds) | How often to refresh the on-chain JAY balance. `0` disables. |
 | `--max-reconnects` | `JAY_MAX_RECONNECTS` | `0` (forever) | Mirrors frontend's 5-attempt cap when set. |
 | `--verbose` | — | off | Sets `RUST_LOG=debug` if not already set. |
+| `--no-color` | `JAY_NO_COLOR` | off | Disable ANSI colors. Windows VT mode is auto-enabled; only set this if your console still shows literal `?[2m`. |
+
+## Rate-limiting & cookies
+
+The `mining.thejaynetwork.com` site sits behind Vercel, which applies anti-bot
+heuristics + per-IP rate limits. To stay under the radar `jay-miner`:
+
+- Does a one-time `GET https://mining.thejaynetwork.com/` on startup (with the
+  same headers a browser sends) so Vercel writes its baseline cookies onto our
+  jar before we POST `/api/ws-token`.
+- Sends Chrome-like `User-Agent`, `Accept-Language`, `Sec-Fetch-*`, and
+  preserves cookies + gzip across the process lifetime.
+- Treats `HTTP 429 Too Many Requests` and Vercel checkpoint HTML as a special
+  case: it parses `Retry-After`, clamps it to `[60 s, 600 s]`, and waits that
+  long before retrying. These hits do **not** advance the exponential
+  reconnect backoff, so a transient block can't push you into the long-tail
+  retry window.
+- Adds ±20 % jitter to every backoff so multiple instances don't pile up on
+  the endpoint at the same instant after a shared rate-limit expires.
+
+If you still see 429 storms from a single IP, your IP is in a "cool-down"
+state — wait 15–30 minutes or switch network. Running multiple wallets from
+the same IP makes it much more likely.
 
 ## Tests & lint
 

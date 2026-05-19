@@ -26,6 +26,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
+# Windows-only: flip the console into Virtual Terminal mode so ANSI color
+# escape codes emitted by tracing-subscriber render correctly in cmd.exe /
+# older PowerShell. No-op on modern Windows Terminal and on non-Windows.
+[target.'cfg(windows)'.dependencies]
+enable-ansi-support = "0.3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

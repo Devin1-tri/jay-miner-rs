@@ -30,11 +30,14 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use url::Url;
 
 const DEFAULT_TOKEN_URL: &str = "https://mining.thejaynetwork.com/api/ws-token";
+const DEFAULT_PAGE_URL: &str = "https://mining.thejaynetwork.com/";
 const DEFAULT_POOL_WS: &str = "wss://api-pool.winnode.xyz";
 const DEFAULT_REST_URL: &str = "https://api-jayn.winnode.xyz";
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const SHARE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const MIN_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(600);
 const SHARE_DIFFICULTY: u64 = 1_000_000;
 const TOKEN_DENOM: &str = "ujay";
 const TOKEN_DECIMALS: u32 = 6;
@@ -103,6 +106,13 @@ struct Cli {
     /// Verbose logging (sets `RUST_LOG=debug` unless already set).
     #[arg(long)]
     verbose: bool,
+
+    /// Disable ANSI color codes in log output. Useful for Windows legacy console
+    /// (cmd.exe, older PowerShell) where escape sequences render as literal `?[2m`.
+    /// On Windows the miner auto-enables Virtual Terminal processing; pass this
+    /// flag if you still see garbled output, or are piping logs into a file.
+    #[arg(long, env = "JAY_NO_COLOR")]
+    no_color: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +307,83 @@ fn build_http_client() -> Result<reqwest::Client> {
         .context("building HTTP client")
 }
 
+/// Returned by `fetch_ws_token` when Vercel rate-limits the request (HTTP 429
+/// or its anti-bot challenge page). Carries the requested backoff so the
+/// reconnect loop can honor `Retry-After` instead of escalating the
+/// exponential backoff and making things worse.
+#[derive(Debug)]
+struct RateLimited {
+    retry_after: Duration,
+    detail: String,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rate-limited by Vercel ({}); honoring Retry-After of {}s",
+            self.detail,
+            self.retry_after.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// Parse an HTTP `Retry-After` header value. The header may contain either a
+/// decimal number of seconds or an HTTP-date; we only honor the seconds form
+/// here (date form would require a TZ-aware parser and Vercel always emits
+/// seconds in practice).
+fn parse_retry_after_secs(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(secs);
+    }
+    None
+}
+
+/// Clamp the suggested rate-limit backoff to a sane window. Vercel sometimes
+/// returns very small values (`1`) that would cause the loop to hammer the
+/// endpoint, and missing-header cases default to 60 s. We also cap at 10 min
+/// so an extreme value can't park the miner forever.
+fn clamp_rate_limit_backoff(secs: u64) -> Duration {
+    let d = Duration::from_secs(secs);
+    if d < MIN_RATE_LIMIT_BACKOFF {
+        MIN_RATE_LIMIT_BACKOFF
+    } else if d > MAX_RATE_LIMIT_BACKOFF {
+        MAX_RATE_LIMIT_BACKOFF
+    } else {
+        d
+    }
+}
+
+/// Visit the public landing page once per process so Vercel sets baseline
+/// cookies (`__vercel_*` / anti-bot tokens) on our jar. The browser does this
+/// implicitly when the user navigates to the site; we have to do it manually
+/// because our first request is the API POST and Vercel treats a cold POST
+/// from a never-seen-before client as more suspicious than a follow-up POST
+/// from a freshly loaded page.
+async fn prewarm_cookies(client: &reqwest::Client, page_url: &str) -> Result<()> {
+    debug!("pre-warming Vercel cookies via GET {page_url}");
+    let resp = client
+        .get(page_url)
+        .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+        .header("accept-language", "en-US,en;q=0.9")
+        .header("sec-fetch-dest", "document")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-site", "none")
+        .header("upgrade-insecure-requests", "1")
+        .send()
+        .await
+        .with_context(|| format!("GET {page_url}"))?;
+    debug!(
+        "pre-warm GET returned HTTP {} ({} cookies set)",
+        resp.status(),
+        resp.cookies().count()
+    );
+    Ok(())
+}
+
 async fn fetch_ws_token(client: &reqwest::Client, token_url: &str) -> Result<String> {
     let resp = client
         .post(token_url)
@@ -314,16 +401,33 @@ async fn fetch_ws_token(client: &reqwest::Client, token_url: &str) -> Result<Str
         .with_context(|| format!("POST {token_url}"))?;
 
     let status = resp.status();
+    let retry_after_hdr = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after_secs);
     let body = resp.text().await.unwrap_or_default();
 
+    if status.as_u16() == 429 {
+        let retry = clamp_rate_limit_backoff(retry_after_hdr.unwrap_or(60));
+        return Err(anyhow!(RateLimited {
+            retry_after: retry,
+            detail: format!(
+                "HTTP 429 Too Many Requests (Retry-After: {}s)",
+                retry.as_secs()
+            ),
+        }));
+    }
+
+    if is_vercel_checkpoint(&body) {
+        let retry = clamp_rate_limit_backoff(retry_after_hdr.unwrap_or(120));
+        return Err(anyhow!(RateLimited {
+            retry_after: retry,
+            detail: format!("Vercel security checkpoint (HTTP {status})"),
+        }));
+    }
+
     if !status.is_success() {
-        if is_vercel_checkpoint(&body) {
-            return Err(anyhow!(
-                "ws-token blocked by Vercel security checkpoint (HTTP {status}). \
-                 Try again from a different IP, or wait a few minutes for the rate-limit \
-                 to expire."
-            ));
-        }
         return Err(anyhow!(
             "ws-token request failed: HTTP {status}: {}",
             truncate_body(&body, 200)
@@ -331,16 +435,10 @@ async fn fetch_ws_token(client: &reqwest::Client, token_url: &str) -> Result<Str
     }
 
     let parsed: TokenResponse = serde_json::from_str(&body).with_context(|| {
-        if is_vercel_checkpoint(&body) {
-            "ws-token response was Vercel checkpoint HTML — pool is throttling this IP. \
-             Slow down reconnects or rotate IP."
-                .to_string()
-        } else {
-            format!(
-                "decoding ws-token response as {{\"token\":\"...\"}} — got: {}",
-                truncate_body(&body, 200)
-            )
-        }
+        format!(
+            "decoding ws-token response as {{\"token\":\"...\"}} — got: {}",
+            truncate_body(&body, 200)
+        )
     })?;
     if parsed.token.is_empty() {
         return Err(anyhow!("ws-token response contained empty token"));
@@ -410,7 +508,19 @@ async fn run_session(
     stats: &Arc<Mutex<Stats>>,
     http: &reqwest::Client,
     started_at: Instant,
+    cookies_warmed: &mut bool,
 ) -> Result<()> {
+    if !*cookies_warmed {
+        // Mimic browser navigation: load the page first so Vercel sets baseline
+        // cookies on the jar. Errors here are non-fatal — we'll still try the
+        // POST and let it fail with a clearer message if cookies aren't enough.
+        if let Err(e) = prewarm_cookies(http, DEFAULT_PAGE_URL).await {
+            debug!("cookie pre-warm failed (non-fatal): {e:#}");
+        } else {
+            *cookies_warmed = true;
+        }
+    }
+
     info!("Requesting WebSocket token from {}", cli.token_url);
     let token = fetch_ws_token(http, &cli.token_url).await?;
     debug!("got ws-token ({} bytes)", token.len());
@@ -869,11 +979,19 @@ fn validate_wallet(addr: &str) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn install_logger(verbose: bool, no_color: bool) {
+    let log_default = if verbose { "debug" } else { "info" };
 
-    let log_default = if cli.verbose { "debug" } else { "info" };
+    // On Windows, try to flip the console into Virtual Terminal mode so the
+    // ANSI escape codes tracing-subscriber emits actually render as colors
+    // instead of garbage like `?[2m`. If that fails (very old console, output
+    // redirected, etc.) we fall back to plain text.
+    let ansi_ok = if no_color {
+        false
+    } else {
+        try_enable_ansi_on_windows()
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -881,8 +999,39 @@ async fn main() -> Result<()> {
         )
         .with_target(false)
         .with_span_events(FmtSpan::NONE)
+        .with_ansi(ansi_ok)
         .compact()
         .init();
+}
+
+#[cfg(windows)]
+fn try_enable_ansi_on_windows() -> bool {
+    // Calling out to the Windows API directly via `windows-sys` would pull in
+    // a multi-MB transitive dep just for one constant. Instead we ask the OS
+    // to enable VT for STD_OUTPUT_HANDLE via the small `enable-ansi-support`
+    // crate (Windows-only, ~200 LoC, no extra deps).
+    enable_ansi_support::enable_ansi_support().is_ok()
+}
+
+#[cfg(not(windows))]
+fn try_enable_ansi_on_windows() -> bool {
+    true
+}
+
+/// Add ±20 % jitter to a backoff so concurrent jay-miner instances don't all
+/// hit the token endpoint at the exact same moment after a shared rate-limit
+/// window expires.
+fn jitter_backoff(base: Duration) -> Duration {
+    let secs = base.as_secs_f64();
+    let factor = 1.0 + (OsRng.gen::<f64>() - 0.5) * 0.4; // 0.8..=1.2
+    Duration::from_secs_f64((secs * factor).max(0.1))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    install_logger(cli.verbose, cli.no_color);
 
     validate_wallet(&cli.wallet)?;
     if !(0.0..=1.0).contains(&cli.intensity) {
@@ -901,15 +1050,35 @@ async fn main() -> Result<()> {
     let stats = Arc::new(Mutex::new(Stats::default()));
     let http = build_http_client()?;
     let started_at = Instant::now();
+    let mut cookies_warmed = false;
 
+    // Two separate counters: `attempt` advances on real session errors and
+    // feeds the exponential backoff; `rate_limit_hits` is just for logging.
+    // A rate-limit response never advances `attempt`, so a transient block
+    // can't push the regular backoff into its long tail.
     let mut attempt: u32 = 0;
+    let mut rate_limit_hits: u32 = 0;
     loop {
-        match run_session(&cli, &ids, &stats, &http, started_at).await {
+        match run_session(&cli, &ids, &stats, &http, started_at, &mut cookies_warmed).await {
             Ok(()) => {
                 info!("session ended cleanly");
                 break Ok(());
             }
             Err(e) => {
+                // Special-case rate-limit responses: honor server-suggested
+                // backoff and don't escalate the regular attempt counter.
+                if let Some(rl) = e.downcast_ref::<RateLimited>() {
+                    rate_limit_hits += 1;
+                    let wait = jitter_backoff(rl.retry_after);
+                    warn!(
+                        "rate-limit hit #{rate_limit_hits}: {} — waiting {}s before retry",
+                        rl.detail,
+                        wait.as_secs()
+                    );
+                    sleep(wait).await;
+                    continue;
+                }
+
                 attempt += 1;
                 // `{e:#}` gives "outer cause: inner cause: leaf" without a 200-line
                 // multi-line Debug dump.
@@ -920,11 +1089,12 @@ async fn main() -> Result<()> {
                         cli.max_reconnects
                     )));
                 }
-                let backoff = Duration::from_millis(
+                let raw_backoff = Duration::from_millis(
                     1000u64
                         .saturating_mul(1u64 << attempt.min(5))
                         .min(MAX_BACKOFF.as_millis() as u64),
                 );
+                let backoff = jitter_backoff(raw_backoff);
                 info!("reconnecting in {}s (attempt {attempt})", backoff.as_secs());
                 sleep(backoff).await;
             }
@@ -1035,5 +1205,51 @@ mod tests {
         assert_eq!(format_uptime(Duration::from_secs(5)), "5s");
         assert_eq!(format_uptime(Duration::from_secs(65)), "1m05s");
         assert_eq!(format_uptime(Duration::from_secs(3725)), "1h02m05s");
+    }
+
+    #[test]
+    fn parse_retry_after_handles_seconds() {
+        assert_eq!(parse_retry_after_secs("60"), Some(60));
+        assert_eq!(parse_retry_after_secs(" 120 "), Some(120));
+        assert_eq!(parse_retry_after_secs("0"), Some(0));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_dates_and_garbage() {
+        // We only honor the integer form; HTTP-date and gibberish return None.
+        assert_eq!(
+            parse_retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        );
+        assert_eq!(parse_retry_after_secs("not-a-number"), None);
+        assert_eq!(parse_retry_after_secs(""), None);
+    }
+
+    #[test]
+    fn clamp_rate_limit_backoff_enforces_min_and_max() {
+        assert_eq!(clamp_rate_limit_backoff(1), MIN_RATE_LIMIT_BACKOFF);
+        assert_eq!(clamp_rate_limit_backoff(59), MIN_RATE_LIMIT_BACKOFF);
+        assert_eq!(clamp_rate_limit_backoff(120), Duration::from_secs(120));
+        assert_eq!(clamp_rate_limit_backoff(10_000), MAX_RATE_LIMIT_BACKOFF);
+    }
+
+    #[test]
+    fn rate_limited_display() {
+        let rl = RateLimited {
+            retry_after: Duration::from_secs(90),
+            detail: "HTTP 429 Too Many Requests".to_string(),
+        };
+        let s = format!("{rl}");
+        assert!(s.contains("HTTP 429"));
+        assert!(s.contains("90"));
+    }
+
+    #[test]
+    fn jitter_stays_in_band() {
+        for _ in 0..200 {
+            let j = jitter_backoff(Duration::from_secs(10));
+            let s = j.as_secs_f64();
+            assert!((7.5..=12.5).contains(&s), "jittered {s} out of band");
+        }
     }
 }
