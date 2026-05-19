@@ -1,0 +1,11 @@
+/target
+.env
+.envrc
+*.swp
+.idea/
+.vscode/
+.DS_Store
+
+# Runtime state files written by jay-miner
+device_id
+*.deviceid
