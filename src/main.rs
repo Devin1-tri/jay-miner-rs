@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -26,14 +26,22 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, sleep, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
+use tracing_subscriber::fmt::format::FmtSpan;
 use url::Url;
 
 const DEFAULT_TOKEN_URL: &str = "https://mining.thejaynetwork.com/api/ws-token";
 const DEFAULT_POOL_WS: &str = "wss://api-pool.winnode.xyz";
+const DEFAULT_REST_URL: &str = "https://api-jayn.winnode.xyz";
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const SHARE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHARE_DIFFICULTY: u64 = 1_000_000;
+const TOKEN_DENOM: &str = "ujay";
+const TOKEN_DECIMALS: u32 = 6;
+
+/// Chrome 120 on Linux — keeps the request from looking obviously bot-shaped.
+const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/120.0.0.0 Safari/537.36";
 
 /// Headless miner for The Jay Network browser pool (`api-pool.winnode.xyz`).
 ///
@@ -67,12 +75,25 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_POOL_WS, env = "JAY_POOL_WS")]
     pool_ws: String,
 
+    /// Base URL of the Cosmos REST API used to query on-chain balance.
+    /// Path queried is `/cosmos/bank/v1beta1/balances/{wallet}`.
+    #[arg(long, default_value = DEFAULT_REST_URL, env = "JAY_REST_URL")]
+    rest_url: String,
+
     /// Path to persist the device ID across runs (mirrors the frontend's `localStorage`).
     ///
     /// Defaults to `./device_id` in the working directory. Delete the file to rotate
     /// the device identity.
     #[arg(long, default_value = "device_id", env = "JAY_DEVICE_ID_FILE")]
     device_id_file: PathBuf,
+
+    /// How often (seconds) to print the periodic status panel. Set 0 to disable.
+    #[arg(long, default_value_t = 10, env = "JAY_STATS_INTERVAL")]
+    stats_interval: u64,
+
+    /// How often (seconds) to refresh the on-chain JAY balance. Set 0 to disable.
+    #[arg(long, default_value_t = 60, env = "JAY_BALANCE_INTERVAL")]
+    balance_interval: u64,
 
     /// Reconnect attempt limit before exiting. Set 0 to retry forever. Mirrors the
     /// frontend's 5-attempt cap.
@@ -145,6 +166,23 @@ impl MinerIds {
     }
 }
 
+/// Shared mining stats updated by the share/share-result/reward handlers and read
+/// by the periodic stats panel + final summary.
+#[derive(Debug, Default)]
+struct Stats {
+    shares_submitted: u64,
+    shares_accepted: u64,
+    shares_rejected: u64,
+    reward_events: u64,
+    total_reward_jay: f64,
+    last_reward_jay: f64,
+    last_reward_tx: Option<String>,
+    last_submitted_hash: Option<String>,
+    last_submitted_nonce: u32,
+    last_balance_jay: Option<f64>,
+    last_balance_at: Option<Instant>,
+}
+
 fn current_millis() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -181,35 +219,182 @@ fn random_hex_64() -> String {
     out
 }
 
+/// Format a `Duration` as `1h02m03s` / `5m23s` / `42s`.
+fn format_uptime(d: Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Shorten a 64-char hex hash to `abcd1234…ef567890` for compact log display.
+fn short_hash(h: &str) -> String {
+    if h.len() <= 18 {
+        h.to_string()
+    } else {
+        format!("{}…{}", &h[..8], &h[h.len() - 8..])
+    }
+}
+
+/// Trim a possibly-huge body (Vercel security checkpoint pages can be many KB of
+/// HTML/SVG) down to a single line of at most `max` chars, with a clear marker
+/// when truncated. Whitespace runs collapse to single spaces so the log stays
+/// on one line.
+fn truncate_body(body: &str, max: usize) -> String {
+    let mut out = String::with_capacity(body.len().min(max + 32));
+    let mut last_was_ws = false;
+    let mut chars = 0;
+    for ch in body.chars() {
+        if ch.is_whitespace() {
+            if !last_was_ws {
+                out.push(' ');
+                chars += 1;
+                last_was_ws = true;
+            }
+        } else {
+            out.push(ch);
+            chars += 1;
+            last_was_ws = false;
+        }
+        if chars >= max {
+            out.push_str(&format!(" …[truncated, full body {} bytes]", body.len()));
+            return out;
+        }
+    }
+    out
+}
+
+/// Detect Vercel's anti-bot challenge page so we can surface a clearer error
+/// message than "HTTP 200, body is HTML".
+fn is_vercel_checkpoint(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("vercel security checkpoint") || lower.contains("enable javascript to continue")
+}
+
 #[derive(Deserialize)]
 struct TokenResponse {
     token: String,
+}
+
+/// Build a `reqwest::Client` that looks like Chrome — UA, Accept-Language,
+/// cookie jar (needed for some Vercel/Cloudflare flows). Cookies persist for
+/// the lifetime of the process so a successful first request can keep us
+/// inside the trusted bucket on subsequent calls.
+fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(BROWSER_UA)
+        .timeout(Duration::from_secs(15))
+        .cookie_store(true)
+        .gzip(true)
+        .build()
+        .context("building HTTP client")
 }
 
 async fn fetch_ws_token(client: &reqwest::Client, token_url: &str) -> Result<String> {
     let resp = client
         .post(token_url)
         .header("content-type", "application/json")
+        .header("accept", "application/json, text/plain, */*")
+        .header("accept-language", "en-US,en;q=0.9")
         .header("origin", "https://mining.thejaynetwork.com")
         .header("referer", "https://mining.thejaynetwork.com/")
+        .header("sec-fetch-dest", "empty")
+        .header("sec-fetch-mode", "cors")
+        .header("sec-fetch-site", "same-origin")
         .body("{}")
         .send()
         .await
         .with_context(|| format!("POST {token_url}"))?;
 
     let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("ws-token request failed: HTTP {status}: {body}"));
+        if is_vercel_checkpoint(&body) {
+            return Err(anyhow!(
+                "ws-token blocked by Vercel security checkpoint (HTTP {status}). \
+                 Try again from a different IP, or wait a few minutes for the rate-limit \
+                 to expire."
+            ));
+        }
+        return Err(anyhow!(
+            "ws-token request failed: HTTP {status}: {}",
+            truncate_body(&body, 200)
+        ));
     }
-    let parsed: TokenResponse = resp
-        .json()
-        .await
-        .context("decoding ws-token response as {\"token\": \"...\"}")?;
+
+    let parsed: TokenResponse = serde_json::from_str(&body).with_context(|| {
+        if is_vercel_checkpoint(&body) {
+            "ws-token response was Vercel checkpoint HTML — pool is throttling this IP. \
+             Slow down reconnects or rotate IP."
+                .to_string()
+        } else {
+            format!(
+                "decoding ws-token response as {{\"token\":\"...\"}} — got: {}",
+                truncate_body(&body, 200)
+            )
+        }
+    })?;
     if parsed.token.is_empty() {
         return Err(anyhow!("ws-token response contained empty token"));
     }
     Ok(parsed.token)
+}
+
+/// Cosmos REST API balance response shape: `{ balances: [{denom, amount}], pagination }`.
+#[derive(Deserialize)]
+struct BalancesResponse {
+    balances: Vec<Coin>,
+}
+
+#[derive(Deserialize)]
+struct Coin {
+    denom: String,
+    amount: String,
+}
+
+/// Query the `ujay` balance for `wallet` and return it as JAY (divided by 10^6).
+async fn fetch_balance(client: &reqwest::Client, rest_url: &str, wallet: &str) -> Result<f64> {
+    let url = format!(
+        "{}/cosmos/bank/v1beta1/balances/{}",
+        rest_url.trim_end_matches('/'),
+        wallet
+    );
+    let resp = client
+        .get(&url)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "balance query HTTP {status}: {}",
+            truncate_body(&body, 200)
+        ));
+    }
+    let parsed: BalancesResponse = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "decoding balance response — got: {}",
+            truncate_body(&body, 200)
+        )
+    })?;
+    let raw = parsed
+        .balances
+        .iter()
+        .find(|c| c.denom == TOKEN_DENOM)
+        .map(|c| c.amount.parse::<u128>().unwrap_or(0))
+        .unwrap_or(0);
+    let divisor = 10f64.powi(TOKEN_DECIMALS as i32);
+    Ok(raw as f64 / divisor)
 }
 
 #[derive(Debug, Serialize)]
@@ -219,20 +404,16 @@ struct ClientMessage<'a> {
     payload: Value,
 }
 
-async fn run_session(cli: &Cli, ids: &MinerIds) -> Result<()> {
-    let http = reqwest::Client::builder()
-        .user_agent(concat!(
-            "jay-miner/",
-            env!("CARGO_PKG_VERSION"),
-            " (+https://github.com/Devin1-tri/jay-miner-rs)"
-        ))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("building HTTP client")?;
-
+async fn run_session(
+    cli: &Cli,
+    ids: &MinerIds,
+    stats: &Arc<Mutex<Stats>>,
+    http: &reqwest::Client,
+    started_at: Instant,
+) -> Result<()> {
     info!("Requesting WebSocket token from {}", cli.token_url);
-    let token = fetch_ws_token(&http, &cli.token_url).await?;
-    debug!(token_len = token.len(), "got ws-token");
+    let token = fetch_ws_token(http, &cli.token_url).await?;
+    debug!("got ws-token ({} bytes)", token.len());
 
     let mut ws_url = Url::parse(&cli.pool_ws)
         .with_context(|| format!("parsing pool ws URL: {}", cli.pool_ws))?;
@@ -247,7 +428,6 @@ async fn run_session(cli: &Cli, ids: &MinerIds) -> Result<()> {
         .with_context(|| "WebSocket connect failed")?;
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
-    // status: online
     send_json(
         &mut ws_tx,
         &ClientMessage {
@@ -262,7 +442,6 @@ async fn run_session(cli: &Cli, ids: &MinerIds) -> Result<()> {
     )
     .await?;
 
-    // start_mining
     let start_payload = {
         let miner_id = ids.miner_id_value().await;
         let mut payload = json!({
@@ -287,21 +466,20 @@ async fn run_session(cli: &Cli, ids: &MinerIds) -> Result<()> {
     )
     .await?;
     info!(
-        wallet = %cli.wallet,
-        threads = cli.threads,
-        intensity = cli.intensity,
-        "mining session started"
+        "mining session started — wallet={} threads={} intensity={:.2}",
+        cli.wallet, cli.threads, cli.intensity
     );
 
-    // Channel for outbound messages so the ping & share tasks can both feed the sink.
+    // Outbound channel feeding the WebSocket writer task.
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
 
+    // --- ping every 30 s
     let ping_tx = out_tx.clone();
     let ids_for_ping = ids.clone();
     let ping_task = tokio::spawn(async move {
         let mut tick = interval(PING_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        tick.tick().await; // first tick fires immediately; skip so the first real ping is at +30s
+        tick.tick().await; // skip the immediate first tick
         loop {
             tick.tick().await;
             let payload = json!({
@@ -320,10 +498,12 @@ async fn run_session(cli: &Cli, ids: &MinerIds) -> Result<()> {
         }
     });
 
+    // --- submit_share every 1 s (gated by intensity)
     let share_tx = out_tx.clone();
     let ids_for_share = ids.clone();
     let wallet_for_share = cli.wallet.clone();
     let intensity = cli.intensity.clamp(0.0, 1.0);
+    let stats_for_share = Arc::clone(stats);
     let share_task = tokio::spawn(async move {
         let mut tick = interval(SHARE_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -337,9 +517,10 @@ async fn run_session(cli: &Cli, ids: &MinerIds) -> Result<()> {
             let miner_id = ids_for_share.miner_id_value().await.unwrap_or_default();
             let job_id = ids_for_share.job_id_value().await;
             let nonce: u32 = OsRng.gen_range(0..1_000_000);
+            let hash = random_hex_64();
             let payload = json!({
                 "nonce": nonce,
-                "hash": random_hex_64(),
+                "hash": hash,
                 "jobId": job_id,
                 "difficulty": SHARE_DIFFICULTY,
                 "sessionId": ids_for_share.session_id,
@@ -352,44 +533,109 @@ async fn run_session(cli: &Cli, ids: &MinerIds) -> Result<()> {
                 payload,
             })
             .expect("share serialization");
+            {
+                let mut s = stats_for_share.lock().await;
+                s.shares_submitted += 1;
+                s.last_submitted_hash = Some(hash);
+                s.last_submitted_nonce = nonce;
+            }
             if share_tx.send(Message::Text(msg)).await.is_err() {
                 break;
             }
         }
     });
 
-    // Writer task: pulls from `out_rx` and writes to the sink.
+    // --- periodic on-chain balance fetch
+    let balance_task = if cli.balance_interval > 0 {
+        let http = http.clone();
+        let rest_url = cli.rest_url.clone();
+        let wallet = cli.wallet.clone();
+        let stats = Arc::clone(stats);
+        let interval_secs = cli.balance_interval;
+        Some(tokio::spawn(async move {
+            // First fetch happens immediately so the stats panel has a value to show.
+            loop {
+                match fetch_balance(&http, &rest_url, &wallet).await {
+                    Ok(bal) => {
+                        let mut s = stats.lock().await;
+                        s.last_balance_jay = Some(bal);
+                        s.last_balance_at = Some(Instant::now());
+                    }
+                    Err(e) => {
+                        debug!("balance refresh failed: {e:#}");
+                    }
+                }
+                sleep(Duration::from_secs(interval_secs)).await;
+            }
+        }))
+    } else {
+        None
+    };
+
+    // --- periodic stats panel
+    let stats_task = if cli.stats_interval > 0 {
+        let stats = Arc::clone(stats);
+        let interval_secs = cli.stats_interval;
+        Some(tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(interval_secs));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            tick.tick().await; // skip the immediate first tick so the panel appears after one period
+            loop {
+                tick.tick().await;
+                let snapshot = {
+                    let s = stats.lock().await;
+                    (
+                        s.shares_submitted,
+                        s.shares_accepted,
+                        s.shares_rejected,
+                        s.reward_events,
+                        s.total_reward_jay,
+                        s.last_reward_jay,
+                        s.last_submitted_hash.clone(),
+                        s.last_submitted_nonce,
+                        s.last_balance_jay,
+                    )
+                };
+                let (sub, acc, rej, rewards, total, last_r, hash, nonce, bal) = snapshot;
+                let uptime = format_uptime(started_at.elapsed());
+                let hash_disp = hash
+                    .as_deref()
+                    .map(short_hash)
+                    .unwrap_or_else(|| "—".to_string());
+                let bal_disp = bal
+                    .map(|b| format!("{b:.6} JAY"))
+                    .unwrap_or_else(|| "(querying)".to_string());
+                info!(
+                    "[stats] up {uptime} | shares {acc}/{sub} ok ({rej} rej) | \
+                     rewards {rewards} ({total:.6} JAY, last {last_r:.6}) | \
+                     balance {bal_disp} | last_hash {hash_disp} nonce={nonce}"
+                );
+            }
+        }))
+    } else {
+        None
+    };
+
+    // --- WebSocket writer
     let writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if let Err(e) = ws_tx.send(msg).await {
-                warn!(err = %e, "WebSocket send failed; closing writer");
+                warn!("WebSocket send failed: {e}");
                 break;
             }
         }
         let _ = ws_tx.close().await;
     });
 
-    // Shutdown signal (Ctrl+C or SIGTERM).
     let shutdown = tokio::spawn(async {
         wait_for_shutdown().await;
     });
-
-    let mut shares_accepted: u64 = 0;
-    let mut shares_rejected: u64 = 0;
-    let mut total_reward: f64 = 0.0;
 
     let read_loop = async {
         while let Some(frame) = ws_rx.next().await {
             match frame {
                 Ok(Message::Text(text)) => {
-                    handle_server_message(
-                        &text,
-                        ids,
-                        &mut shares_accepted,
-                        &mut shares_rejected,
-                        &mut total_reward,
-                    )
-                    .await;
+                    handle_server_message(&text, ids, stats).await;
                 }
                 Ok(Message::Binary(_)) => debug!("ignoring binary frame"),
                 Ok(Message::Ping(p)) => {
@@ -397,11 +643,11 @@ async fn run_session(cli: &Cli, ids: &MinerIds) -> Result<()> {
                 }
                 Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
                 Ok(Message::Close(c)) => {
-                    info!(close = ?c, "pool closed the connection");
+                    info!("pool closed the connection: {c:?}");
                     break;
                 }
                 Err(e) => {
-                    warn!(err = %e, "WebSocket read error");
+                    warn!("WebSocket read error: {e}");
                     break;
                 }
             }
@@ -435,22 +681,34 @@ async fn run_session(cli: &Cli, ids: &MinerIds) -> Result<()> {
                 }),
             }).unwrap();
             let _ = out_tx.send(Message::Text(offline)).await;
-            // Allow writer a moment to flush, then close.
             sleep(Duration::from_millis(250)).await;
         }
     }
 
-    // Drop the outbound channel sender so writer finishes naturally.
     drop(out_tx);
     ping_task.abort();
     share_task.abort();
+    if let Some(t) = balance_task {
+        t.abort();
+    }
+    if let Some(t) = stats_task {
+        t.abort();
+    }
     let _ = writer.await;
 
+    let final_snap = {
+        let s = stats.lock().await;
+        (
+            s.shares_accepted,
+            s.shares_rejected,
+            s.shares_submitted,
+            s.total_reward_jay,
+            s.reward_events,
+        )
+    };
     info!(
-        shares_accepted,
-        shares_rejected,
-        total_reward = format!("{:.6} JAY", total_reward),
-        "session finished"
+        "session finished — shares {}/{} ok ({} rej), {} reward events totaling {:.6} JAY",
+        final_snap.0, final_snap.2, final_snap.1, final_snap.4, final_snap.3
     );
     Ok(())
 }
@@ -460,23 +718,20 @@ where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let text = serde_json::to_string(msg).context("serializing client message")?;
-    debug!(msg = %text, "ws -> pool");
+    debug!("ws -> pool: {text}");
     sink.send(Message::Text(text))
         .await
         .context("WebSocket send")
 }
 
-async fn handle_server_message(
-    text: &str,
-    ids: &MinerIds,
-    shares_accepted: &mut u64,
-    shares_rejected: &mut u64,
-    total_reward: &mut f64,
-) {
+async fn handle_server_message(text: &str, ids: &MinerIds, stats: &Arc<Mutex<Stats>>) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
-            warn!(err = %e, raw = %text, "non-JSON server message");
+            warn!(
+                "non-JSON server message ({e}): {}",
+                truncate_body(text, 120)
+            );
             return;
         }
     };
@@ -490,11 +745,13 @@ async fn handle_server_message(
     match msg_type {
         "auth_success" | "mining_started" => {
             if let Some(miner_id) = payload.get("minerId").and_then(Value::as_str) {
-                let mut slot = ids.miner_id.lock().await;
-                *slot = Some(miner_id.to_string());
-                info!(miner_id, "{}", msg_type);
+                {
+                    let mut slot = ids.miner_id.lock().await;
+                    *slot = Some(miner_id.to_string());
+                }
+                info!("{msg_type} (minerId={miner_id})");
             } else {
-                info!(payload = %payload, "{}", msg_type);
+                info!("{msg_type}");
             }
         }
         "job" => {
@@ -507,34 +764,53 @@ async fn handle_server_message(
                     let mut slot = ids.job_id.lock().await;
                     *slot = job_id.to_string();
                 }
-                debug!(job_id, target, "new job from pool");
+                debug!("new job: id={job_id} target={target}");
             }
         }
         "share_accepted" => {
-            *shares_accepted += 1;
-            debug!(total = *shares_accepted, "share accepted");
+            let mut s = stats.lock().await;
+            s.shares_accepted += 1;
+            debug!("share accepted (total {})", s.shares_accepted);
         }
         "share_rejected" => {
-            *shares_rejected += 1;
-            warn!(payload = %payload, total = *shares_rejected, "share rejected");
+            let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("?");
+            let mut s = stats.lock().await;
+            s.shares_rejected += 1;
+            warn!(
+                "share rejected ({reason}) — total rejected {}",
+                s.shares_rejected
+            );
         }
         "mining_reward" => {
             let amount = payload.get("amount").and_then(Value::as_f64).unwrap_or(0.0);
             let shares = payload.get("shares").and_then(Value::as_u64).unwrap_or(0);
-            let tx_hash = payload.get("txHash").and_then(Value::as_str).unwrap_or("");
-            *total_reward += amount;
+            let tx_hash = payload
+                .get("txHash")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let tx_disp = tx_hash
+                .as_deref()
+                .map(short_hash)
+                .unwrap_or_else(|| "—".to_string());
+            {
+                let mut s = stats.lock().await;
+                s.reward_events += 1;
+                s.total_reward_jay += amount;
+                s.last_reward_jay = amount;
+                s.last_reward_tx = tx_hash;
+            }
+            let running = {
+                let s = stats.lock().await;
+                s.total_reward_jay
+            };
             info!(
-                amount,
-                shares,
-                tx = tx_hash,
-                running_total = format!("{:.6} JAY", *total_reward),
-                "mining_reward"
+                "reward +{amount:.6} JAY (shares {shares}, tx {tx_disp}) — running total {running:.6} JAY"
             );
         }
-        "block_found" => info!(payload = %payload, "block_found"),
-        "pool_stats" => debug!(payload = %payload, "pool_stats"),
+        "block_found" => info!("block_found: {payload}"),
+        "pool_stats" => debug!("pool_stats: {payload}"),
         "pong" => debug!("pong"),
-        other => debug!(other, payload = %payload, "server message"),
+        other => debug!("server message {other}: {payload}"),
     }
 }
 
@@ -545,7 +821,7 @@ async fn wait_for_shutdown() {
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(e) => {
-                warn!(err = %e, "failed to install SIGTERM handler; only Ctrl+C will shut down");
+                warn!("failed to install SIGTERM handler ({e}); only Ctrl+C will shut down");
                 tokio::signal::ctrl_c().await.ok();
                 return;
             }
@@ -604,6 +880,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_default)),
         )
         .with_target(false)
+        .with_span_events(FmtSpan::NONE)
+        .compact()
         .init();
 
     validate_wallet(&cli.wallet)?;
@@ -616,21 +894,26 @@ async fn main() -> Result<()> {
 
     let ids = MinerIds::load(&cli.device_id_file).await?;
     info!(
-        session_id = %ids.session_id,
-        device_id = %ids.device_id,
-        "miner identifiers ready"
+        "miner identifiers ready — sessionId={} deviceId={}",
+        ids.session_id, ids.device_id
     );
+
+    let stats = Arc::new(Mutex::new(Stats::default()));
+    let http = build_http_client()?;
+    let started_at = Instant::now();
 
     let mut attempt: u32 = 0;
     loop {
-        match run_session(&cli, &ids).await {
+        match run_session(&cli, &ids, &stats, &http, started_at).await {
             Ok(()) => {
                 info!("session ended cleanly");
                 break Ok(());
             }
             Err(e) => {
                 attempt += 1;
-                warn!(err = %e, attempt, "session error");
+                // `{e:#}` gives "outer cause: inner cause: leaf" without a 200-line
+                // multi-line Debug dump.
+                warn!("session error (attempt {attempt}): {e:#}");
                 if cli.max_reconnects != 0 && attempt >= cli.max_reconnects {
                     return Err(e.context(format!(
                         "giving up after {} reconnect attempts",
@@ -642,10 +925,7 @@ async fn main() -> Result<()> {
                         .saturating_mul(1u64 << attempt.min(5))
                         .min(MAX_BACKOFF.as_millis() as u64),
                 );
-                info!(
-                    backoff_secs = backoff.as_secs(),
-                    attempt, "reconnecting after backoff"
-                );
+                info!("reconnecting in {}s (attempt {attempt})", backoff.as_secs());
                 sleep(backoff).await;
             }
         }
@@ -715,5 +995,45 @@ mod tests {
         assert!(s.contains("token="), "token kv must remain: {s}");
         assert!(!s.contains("supersecret123"), "secret leaked: {s}");
         assert!(s.contains("redacted"), "redacted marker missing: {s}");
+    }
+
+    #[test]
+    fn truncate_body_collapses_whitespace_and_caps_length() {
+        let html = "<html>\n   <body>\n      <p>hello\nworld</p>\n   </body>\n</html>";
+        let t = truncate_body(html, 200);
+        assert!(!t.contains('\n'), "must be single-line: {t}");
+        assert!(!t.contains("  "), "double spaces should collapse: {t}");
+    }
+
+    #[test]
+    fn truncate_body_marks_when_truncated() {
+        let body = "a".repeat(5000);
+        let t = truncate_body(&body, 100);
+        assert!(t.contains("truncated"), "should mark truncation: {t}");
+        assert!(t.contains("5000 bytes"), "should report full size: {t}");
+    }
+
+    #[test]
+    fn vercel_checkpoint_detection() {
+        assert!(is_vercel_checkpoint(
+            "blah <p>Vercel Security Checkpoint</p> blah"
+        ));
+        assert!(is_vercel_checkpoint("Enable JavaScript to continue"));
+        assert!(!is_vercel_checkpoint("{\"token\":\"abc\"}"));
+    }
+
+    #[test]
+    fn short_hash_format() {
+        let h = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let s = short_hash(h);
+        assert_eq!(s, "01234567…89abcdef");
+        assert_eq!(short_hash("abcd"), "abcd");
+    }
+
+    #[test]
+    fn format_uptime_buckets() {
+        assert_eq!(format_uptime(Duration::from_secs(5)), "5s");
+        assert_eq!(format_uptime(Duration::from_secs(65)), "1m05s");
+        assert_eq!(format_uptime(Duration::from_secs(3725)), "1h02m05s");
     }
 }

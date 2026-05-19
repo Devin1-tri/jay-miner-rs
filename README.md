@@ -91,6 +91,30 @@ Binary lands at `target/release/jay-miner` (~5 MB, statically-linked rustls).
 All flags also accept env vars (e.g. `JAY_WALLET`, `JAY_THREADS`). Use
 `--verbose` (or `RUST_LOG=debug`) to see the raw frames.
 
+### Sample log output
+
+Default `info`-level logs are compact, single-line, and include a periodic
+`[stats]` panel (every 10 s) plus a real-time reward line on every
+`mining_reward` event:
+
+```
+2026-05-19T06:30:00.000Z  INFO miner identifiers ready — sessionId=session_… deviceId=device_…
+2026-05-19T06:30:00.123Z  INFO Requesting WebSocket token from https://mining.thejaynetwork.com/api/ws-token
+2026-05-19T06:30:00.456Z  INFO Connecting to pool: wss://api-pool.winnode.xyz/?token=<256-char-redacted>
+2026-05-19T06:30:00.789Z  INFO mining session started — wallet=yjay1… threads=4 intensity=1.00
+2026-05-19T06:30:01.001Z  INFO auth_success (minerId=miner_abc123)
+2026-05-19T06:30:42.345Z  INFO reward +0.001234 JAY (shares 42, tx 1a2b3c4d…ef567890) — running total 0.001234 JAY
+2026-05-19T06:30:10.000Z  INFO [stats] up 10s | shares 9/10 ok (0 rej) | rewards 0 (0.000000 JAY, last 0.000000) | balance 0.000000 JAY | last_hash 0123abcd…ef456789 nonce=874213
+```
+
+If the token endpoint is throttled by Vercel's anti-bot challenge you'll get a
+clean one-line error (no HTML/SVG dumped into the log):
+
+```
+2026-05-19T06:33:01.205Z  WARN session error (attempt 3): ws-token blocked by Vercel security checkpoint (HTTP 200). Try again from a different IP, or wait a few minutes for the rate-limit to expire.
+2026-05-19T06:33:01.206Z  INFO reconnecting in 8s (attempt 3)
+```
+
 The miner writes `./device_id` on first run and reuses it on subsequent runs
 (mirroring the frontend's `localStorage`). Delete the file to rotate the
 device identity.
@@ -148,7 +172,10 @@ jay-miner --help
 | `--intensity` | `JAY_INTENSITY` | `1.0` | Share-emit probability per second, 0.0–1.0. |
 | `--token-url` | `JAY_TOKEN_URL` | `https://mining.thejaynetwork.com/api/ws-token` | |
 | `--pool-ws` | `JAY_POOL_WS` | `wss://api-pool.winnode.xyz` | |
+| `--rest-url` | `JAY_REST_URL` | `https://api-jayn.winnode.xyz` | Cosmos REST API used to read on-chain JAY balance. |
 | `--device-id-file` | `JAY_DEVICE_ID_FILE` | `./device_id` | |
+| `--stats-interval` | `JAY_STATS_INTERVAL` | `10` (seconds) | How often to print the `[stats]` panel. `0` disables. |
+| `--balance-interval` | `JAY_BALANCE_INTERVAL` | `60` (seconds) | How often to refresh the on-chain JAY balance. `0` disables. |
 | `--max-reconnects` | `JAY_MAX_RECONNECTS` | `0` (forever) | Mirrors frontend's 5-attempt cap when set. |
 | `--verbose` | — | off | Sets `RUST_LOG=debug` if not already set. |
 
