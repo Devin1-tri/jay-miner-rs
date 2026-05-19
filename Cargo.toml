@@ -1,0 +1,32 @@
+[package]
+name = "jay-miner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Headless Rust client that mirrors the Jay Network browser-mining protocol"
+license = "MIT"
+repository = "https://github.com/Devin1-tri/jay-miner-rs"
+readme = "README.md"
+
+[[bin]]
+name = "jay-miner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "=4.5.20", features = ["derive", "env"] }
+futures-util = "0.3"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs", "io-util"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
